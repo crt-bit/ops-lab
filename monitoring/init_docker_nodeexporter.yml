@@ -1,0 +1,124 @@
+---
+- name: 初始化阿里云ECS：Docker + Node Exporter
+  hosts: all  #inventory.ini中[all]分组下全部主机执行这套任务
+  become: yes  #开启提权，所有任务以root权限运行，安装软件、写系统文件必须root
+  gather_facts: true  #收集远端服务器系统信息
+  tasks:
+    # ========== Docker 安装 ==========
+    - name: 更新apt缓存（Debian/Ubuntu）
+      apt:
+        update_cache: yes  #刷新软件源缓存
+        cache_valid_time: 3600 #缓存有效期1小时
+      when: ansible_os_family == "Debian" #条件判断，只有Debian/Ubuntu系统才执行这条任务
+
+    - name: 安装docker依赖包
+      package:  #通用软件包模块
+        name:
+          - apt-transport-https  #让apt支持https源
+          - ca-certificates  #https证书
+          - curl  
+          - gnupg  #gpg密钥工具，用于校验docker软件包签名
+          - lsb-release  #获取系统版本号
+        state: present  #确保软件已安装
+
+    - name: 添加docker GPG key（带重试机制）
+      apt_key:  #导入docker官方GPG公钥，校验docker软件包合法性，防止篡改
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      register: gpg_result  #把本次任务执行结果存入变量gpg_result
+      until: gpg_result is success  #重试机制
+      retries: 3  #最多重试3次
+      delay: 5  #每次间隔5秒
+
+    - name: 添加docker apt源（阿里云镜像加速）
+      apt_repository:  #写入apt源配置文件/etc/apt/sources.list.d/*.list
+        repo: deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+
+#============安装docker社区版===============
+
+    - name: 安装docker-ce
+      apt:
+        name: docker-ce
+        state: present
+
+    - name: 启动并开机自启docker
+      service:
+        name: docker
+        state: started  #当前立即启动docker
+        enabled: yes  #设置开机自启
+
+    # ========== Node Exporter 安装 ==========
+    - name: 创建node_exporter系统用户
+      user:
+        name: node_exporter
+        system: yes
+        shell: /usr/sbin/nologin  #禁止该用户ssh登录
+
+    - name: 下载node_exporter v1.8.2
+      get_url:  #在远端服务器直接下载github二进制压缩包
+        url: "https://mirror.tuna.tsinghua.edu.cn/github-release/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter.tar.gz"
+        mode: '0644'
+      register: download_result
+      until: download_result is success
+      retries: 3
+      delay: 5
+
+    - name: 解压tar包
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp
+        remote_src: yes  #压缩包再远端服务器磁盘上
+
+    - name: 拷贝二进制到/usr/local/bin
+      copy:
+        src: "/tmp/node_exporter-1.8.2.linux-amd64/node_exporter"
+        dest: "/usr/local/bin/node_exporter"
+        owner: node_exporter
+        group: node_exporter
+        mode: '0755'
+        remote_src: yes  #源文件在远端服务器磁盘
+
+    - name: 写入node_exporter systemd单元文件
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter --no-collector.arp
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: 重载systemd并启动node_exporter
+      systemd:
+        name: node_exporter
+        daemon_reload: yes  #写入新service文件后，必须重载syetemd识别新单元
+        state: started #立即启动
+        enabled: yes  #设置开机自启
+
+    - name: 验证node_exporter端口监听
+      shell: ss -tlnp | grep 9100
+      register: port_check
+      failed_when: false  #即使没有输出端口，任务也不标记失败，方便后面debug打印排查信息
+
+    - name: 打印端口监听状态
+      debug:  #把端口检查结果打印到ansible输出日志
+        msg: "{{ port_check.stdout_lines }}"
+
+    - name: 清理临时文件
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:  #loop循环，清理两台服务器/tmp目录下的下载和解压的临时文件，保持服务器整洁
+        - "/tmp/node_exporter.tar.gz"
+        - "/tmp/node_exporter-1.8.2.linux-amd64"
